@@ -25,6 +25,8 @@ export default class Camera extends RingPolledDevice {
             ? this.device.data.settings.video_settings.hevc_enabled
             : false
 
+        this.motionDescriptionPollActive = false
+
         this.data = {
             motion: {
                 active_ding: false,
@@ -38,6 +40,7 @@ export default class Camera extends RingPolledDevice {
                 detection_types: [],
                 familiar_faces: [],
                 description: null,
+                event_group: null,
                 detection_enabled: null,
                 warning_enabled: null,
                 events: events.filter(event => event.event_type === 'motion'),
@@ -566,7 +569,8 @@ export default class Camera extends RingPolledDevice {
             this.data.motion.detection_types = pushDetectionType ? [pushDetectionType] : []
             this.data.motion.familiar_faces = []
             this.data.motion.description = null
-            this.pollMotionEventDescription(this.data.motion.last_ding)
+            this.data.motion.event_group = null
+            this.pollMotionEventDescription()
             if (this.data.snapshot.motion) {
                 this.refreshSnapshot('motion', pushData?.img?.snapshot_uuid)
             }
@@ -635,21 +639,78 @@ export default class Camera extends RingPolledDevice {
         this.data.motion.description = cv.full_description || cv.short_description || null
     }
 
-    async pollMotionEventDescription(dingTimestamp) {
-        // Ring's cloud CV pipeline typically populates full_description and profiles
-        // 5-10 seconds after the initial motion push notification arrives.
-        await utils.sleep(6)
-        for (let attempt = 0; attempt < 3; attempt++) {
-            if (!this.data.motion.active_ding || this.data.motion.last_ding !== dingTimestamp) {
-                return
+    // Per-camera feature flags from the device data ring-client-api refreshes on each status poll.
+    // The follow-up poll waits for the AI description (familiar faces arrive in the same event),
+    // so it only runs when descriptions are both available on the plan and turned on.
+    isFeatureEnabled(feature) {
+        const flags = this.device.data?.features?.[feature]
+        return Boolean(flags?.eligibility?.eligible && flags?.enablement?.enabled)
+    }
+
+    isAiEventDataEnabled() {
+        return this.isFeatureEnabled('smart_video_description')
+    }
+
+    isSingleEventAlertEnabled() {
+        return this.isFeatureEnabled('single_alert')
+    }
+
+    // The v3 history endpoint returns the same events as v2 plus Single Event Alert groups, but
+    // without recording URLs, so it is only used for this poll and never for recording playback.
+    // Groups are omitted when filtering by event_types, so the newest motion event is picked here.
+    async getEventFeed(options) {
+        try {
+            const response = await this.device.restClient.request({
+                method: 'GET',
+                url: `https://api.ring.com/evm/v3/history/devices${this.getSearchQueryString({
+                    source_ids: this.device.id,
+                    capabilities: 'offline_event',
+                    ...options,
+                })}`
+            })
+            return response ? { items: response.events, groups: response.groups } : response
+        } catch (err) {
+            this.debug(err)
+            this.debug('Failed to retrieve device event feed from Ring API')
+        }
+    }
+
+    updateMotionEventGroup(event, groups) {
+        const group = Array.isArray(groups)
+            ? groups.find(g => g?.activities?.some(activity => activity?.id === event.event_id))
+            : null
+        this.data.motion.event_group = group
+            ? {
+                description: group.description || null,
+                start_time: group.start_time || null,
+                event_count: Array.isArray(group.activities) ? group.activities.length : 0
             }
-            const response = await this.getDeviceHistory({ limit: 5, event_types: 'motion' })
-            if (Array.isArray(response?.items) && response.items.length > 0) {
-                this.data.motion.events = response.items
-                const latestEvent = response.items[0]
-                const eventTime = latestEvent?.start_time ? Math.floor(new Date(latestEvent.start_time) / 1000) : 0
-                if (Math.abs(eventTime - dingTimestamp) <= 60) {
+            : null
+    }
+
+    async pollMotionEventDescription() {
+        if (this.motionDescriptionPollActive || !this.isAiEventDataEnabled()) {
+            return
+        }
+        this.motionDescriptionPollActive = true
+        try {
+            // The event usually appears in history with its description about 10 seconds after the
+            // motion push, so the first request is delayed to avoid requests that can't succeed yet
+            await utils.sleep(10)
+            for (let attempt = 0; attempt < 3 && this.data.motion.active_ding; attempt++) {
+                if (attempt > 0) {
+                    await utils.sleep(4)
+                }
+                const response = this.isSingleEventAlertEnabled()
+                    ? await this.getEventFeed({ limit: 3 })
+                    : await this.getDeviceHistory({ limit: 1, event_types: 'motion' })
+                const latestEvent = response?.items
+                    ?.filter(event => event.event_type === 'motion')
+                    .sort((a, b) => new Date(b.start_time) - new Date(a.start_time))[0]
+                const eventTime = latestEvent?.start_time ? Math.floor(new Date(latestEvent.start_time)/1000) : 0
+                if (latestEvent && Math.abs(eventTime - this.data.motion.last_ding) <= 60) {
                     this.updateMotionCvData(latestEvent)
+                    this.updateMotionEventGroup(latestEvent, response.groups)
                     this.data.motion.latestEventId = latestEvent.event_id
                     this.publishMotionAttributes()
                     if (this.data.motion.description) {
@@ -657,9 +718,8 @@ export default class Camera extends RingPolledDevice {
                     }
                 }
             }
-            if (attempt < 2) {
-                await utils.sleep(4)
-            }
+        } finally {
+            this.motionDescriptionPollActive = false
         }
     }
 
@@ -671,7 +731,12 @@ export default class Camera extends RingPolledDevice {
             ...this.data.motion.detection_type ? { detectionType: this.data.motion.detection_type } : {},
             ...this.data.motion.detection_types?.length ? { detectionTypes: this.data.motion.detection_types } : {},
             ...this.data.motion.familiar_faces?.length ? { familiarFaces: this.data.motion.familiar_faces } : {},
-            ...this.data.motion.description ? { description: this.data.motion.description } : {}
+            ...this.data.motion.description ? { description: this.data.motion.description } : {},
+            ...this.data.motion.event_group ? {
+                groupDescription: this.data.motion.event_group.description,
+                groupStartTime: this.data.motion.event_group.start_time,
+                groupEventCount: this.data.motion.event_group.event_count
+            } : {}
         }
         if (this.device.data.settings && typeof this.device.data.settings.motion_detection_enabled !== 'undefined') {
             this.data.motion.detection_enabled = this.device.data.settings.motion_detection_enabled
